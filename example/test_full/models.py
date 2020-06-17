@@ -336,3 +336,9 @@ class ConcreteWithForeignKey(AbstractWithForeignKey):
     @computed(models.IntegerField(default=0), depends=['concrete_target#c'])
     def concrete_c_proxy(self):
         return self.concrete_target.c
+
+
+class ConcreteWithForeignKey2(AbstractWithForeignKey):
+    @computed(models.IntegerField(default=0), depends=['target#d'])
+    def d2(self):
+        return self.target.d
