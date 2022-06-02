@@ -10,6 +10,7 @@ import pickle
 
 from django.db import transaction
 from django.db.models import QuerySet
+from django.db.models.signals import post_save
 from django.conf import settings
 from django.core.exceptions import FieldDoesNotExist
 
@@ -653,16 +654,29 @@ class Resolver:
                 if has_changed:
                     change.append(elem)
                 if len(change) >= self._batchsize:
-                    model.objects.bulk_update(change, fields)
+                    self._update(model, change, fields)
                     change = []
             if change:
-                model.objects.bulk_update(change, fields)
+                self._update(model, change, fields)
 
         # trigger dependent comp field updates on all records
         # skip recursive call if queryset is empty
         if not local_only and queryset:
             self.update_dependent(queryset, model, fields, update_local=False)
         return set(el.pk for el in queryset) if return_pks else None
+
+    def _update(self, model, change, fields):
+        model.objects.bulk_update(change, fields)
+
+        for obj in change:
+            post_save.send_robust(
+                sender=model,
+                instance=obj,
+                created=False,
+                raw=False,
+                update_fields=fields,
+                using=obj._state.db
+            )
 
     def _compute(self, instance, model, fieldname):
         """
