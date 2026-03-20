@@ -7,15 +7,16 @@ removes redundant dependencies. Finally the dependencies are translated
 to the resolver map to be used later by ``update_dependent`` and in
 the signal handlers.
 """
-from collections import OrderedDict
 from os import PathLike
 from django.core.exceptions import FieldDoesNotExist
-from django.db.models import ForeignKey
-from computedfields.helper import pairwise, modelname, parent_to_inherited_path, skip_equal_segments
+from django.db.models import ForeignKey, ManyToOneRel
+from computedfields.helpers import pairwise, modelname, parent_to_inherited_path, skip_equal_segments
+from collections import defaultdict
+
 
 # typing imports
 from typing import (Callable, Dict, FrozenSet, Generic, Hashable, Any, List, Optional, Sequence,
-                    Set, Tuple, TypeVar, Type, Union)
+                    Set, Tuple, TypeVar, Type, Union, cast)
 from typing_extensions import TypedDict
 from django.db.models import Model, Field
 
@@ -36,6 +37,7 @@ class IComputedData(TypedDict):
     select_related: Sequence[str]
     prefetch_related: Sequence[Any]
     querysize: Optional[int]
+    default_on_create: Optional[bool]
 
 
 # django Field type extended by our _computed data attribute
@@ -57,6 +59,26 @@ class IDependsData(TypedDict):
 class ILocalMroData(TypedDict):
     base: List[str]
     fields: Dict[str, int]
+
+
+class IM2mData(TypedDict):
+    left: str
+    right: str
+IM2mMap = Dict[Type[Model], IM2mData]
+
+
+class IChange(TypedDict):
+    pks: Set[Any]
+    fields: Optional[Set[str]]
+IRecorded = Dict[Type[Model], IChange]
+
+class IChangeStrict(TypedDict):
+    pks: Set[Any]
+    fields: Set[str]
+IRecordedStrict = Dict[Type[Model], IChangeStrict]
+
+IModelUpdate = Dict[Type[Model], Tuple[Set[str], Set[str]]]
+IModelUpdateCache = Dict[Type[Model], Dict[Optional[FrozenSet[str]], IModelUpdate]]
 
 
 # global deps: {cfModel: {cfname: {srcModel: {'path': lookup_path, 'depends': src_fieldname}}}}
@@ -316,10 +338,10 @@ class Graph:
         Might raise a ``CycleEdgeException``. For in-depth cycle detection
         use ``edge_cycles``, `node_cycles`` or ``get_cycles()``.
         """
-        left_edges: Dict[Node, List[Edge]] = OrderedDict()
+        left_edges: Dict[Node, List[Edge]] = defaultdict(list)
         paths: List[List[Edge]] = []
         for edge in self.edges:
-            left_edges.setdefault(edge.left, []).append(edge)
+            left_edges[edge.left].append(edge)
         for edge in self.edges:
             self._get_edge_paths(edge, left_edges, paths)
         return paths
@@ -355,7 +377,7 @@ class Graph:
             seen = []
         if edge in seen:
             cycle: FrozenSet[Edge] = frozenset(seen[seen.index(edge):])
-            data: ICycleData = cycles.setdefault(cycle, {'entries': set(), 'path': []})
+            data: ICycleData = cycles[cycle]
             if seen:
                 data['entries'].add(seen[0])
             data['path'] = seen[seen.index(edge):]
@@ -389,10 +411,10 @@ class Graph:
         An edge in ``entries`` is not necessarily part of the cycle itself,
         but once entered it will lead to the cycle.
         """
-        left_edges: Dict[Node, List[Edge]] = OrderedDict()
-        cycles: Dict[FrozenSet[Edge], ICycleData] = {}
+        left_edges: Dict[Node, List[Edge]] = defaultdict(list)
+        cycles: Dict[FrozenSet[Edge], ICycleData] = defaultdict(lambda: {'entries': set(), 'path': []})
         for edge in self.edges:
-            left_edges.setdefault(edge.left, []).append(edge)
+            left_edges[edge.left].append(edge)
         for edge in self.edges:
             self._get_cycles(edge, left_edges, cycles)
         return cycles
@@ -453,6 +475,7 @@ class ComputedModelsGraph(Graph):
         ``computed_models`` is ``Resolver.computed_models``.
         """
         super(ComputedModelsGraph, self).__init__()
+        self._m2m: IM2mMap = {}
         self._computed_models: Dict[Type[Model], Dict[str, IComputedField]] = computed_models
         self.models: Dict[str, Type[Model]] = {}
         self.resolved: IResolvedDeps = self.resolve_dependencies(computed_models)
@@ -472,6 +495,40 @@ class ComputedModelsGraph(Graph):
         f = model._meta.get_field(fieldname)
         if not f.concrete or f.many_to_many:
             raise ComputedFieldsException(f"{model} has no concrete field named '{fieldname}'")
+    
+    def _expand_m2m(self, model: Type[Model], path: str) -> str:
+        """
+        Expand M2M dependencies into through model.
+        """
+        cls: Type[Model] = model
+        symbols: list[str] = []
+        for symbol in path.split('.'):
+            try:
+                rel: Any = cls._meta.get_field(symbol)
+            except FieldDoesNotExist:
+                descriptor = getattr(cls, symbol)
+                rel = getattr(descriptor, 'rel', None) or getattr(descriptor, 'related')
+            if rel.many_to_many:
+                if hasattr(rel, 'through'):
+                    through = rel.through
+                    m2m_field_name = rel.remote_field.m2m_field_name()
+                    m2m_reverse_field_name = rel.remote_field.m2m_reverse_field_name()
+                    symbols.append(through._meta.get_field(m2m_reverse_field_name).related_query_name())
+                    symbols.append(m2m_field_name)
+                else:
+                    through = rel.remote_field.through
+                    m2m_field_name = rel.m2m_field_name()
+                    m2m_reverse_field_name = rel.m2m_reverse_field_name()
+                    symbols.append(through._meta.get_field(m2m_field_name).related_query_name())
+                    symbols.append(m2m_reverse_field_name)
+                self._m2m[through] = {
+                    'left': m2m_field_name,
+                    'right': m2m_reverse_field_name
+                }
+            else:
+                symbols.append(symbol)
+            cls = rel.related_model
+        return '.'.join(symbols)
 
     def resolve_dependencies(
         self,
@@ -488,20 +545,19 @@ class ComputedModelsGraph(Graph):
 
         - fk relations are added on the model holding the fk field
         - reverse fk relations are added on related model holding the fk field
-        - m2m fields and backrelations are added on the model directly, but
-          only used for inter-model resolving, never for field lookups during ``save``
+        - m2m fields are expanded via their through model
         """
-        global_deps: IGlobalDeps = OrderedDict()
-        local_deps: ILocalDeps = {}
+        global_deps: IGlobalDeps = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+        local_deps: ILocalDeps = defaultdict(lambda: defaultdict(set))
         for model, fields in computed_models.items():
             # skip proxy models for graph handling,
             # deps get patched at runtime from resolved real models
             if model._meta.proxy:
                 continue
-            local_deps.setdefault(model, {})  # always add to local to get a result for MRO
+            local_deps[model]   # always add to local to get a result for MRO
             for field, real_field in fields.items():
-                fieldentry = global_deps.setdefault(model, {}).setdefault(field, {})
-                local_deps.setdefault(model, {}).setdefault(field, set())
+                fieldentry = global_deps[model][field]
+                local_deps[model][field]
 
                 depends: IDepends = real_field._computed['depends']
 
@@ -540,30 +596,34 @@ class ComputedModelsGraph(Graph):
                         # do at least an existance check here to provide an early error
                         for fieldname in fieldnames:
                             self._right_constrain(model, fieldname)
-                        local_deps.setdefault(model, {}).setdefault(field, set()).update(fieldnames)
+                        local_deps[model][field].update(fieldnames)
                         continue
+
+                    # expand m2m into through model
+                    path = self._expand_m2m(model, path)
+
                     path_segments: List[str] = []
                     cls: Type[Model] = model
                     for symbol in path.split('.'):
                         try:
                             rel: Any = cls._meta.get_field(symbol)
-                            if rel.many_to_many:
-                                # add dependency to m2m relation fields
+                            if isinstance(rel, ManyToOneRel):
+                                symbol = rel.field.related_query_name()
+                                # add dependency to reverse relation field as well
+                                # this needs to be added in opposite direction on related model
                                 path_segments.append(symbol)
-                                fieldentry.setdefault(rel.related_model, []).append(
-                                    {'path': '__'.join(path_segments), 'depends': rel.remote_field.name})
+                                fieldentry[cast(Type[Model], rel.related_model)].append(
+                                    {'path': '__'.join(path_segments), 'depends': rel.field.name})
                                 path_segments.pop()
                         except FieldDoesNotExist:
                             # handle reverse relation (not a concrete field)
                             descriptor = getattr(cls, symbol)
                             rel = getattr(descriptor, 'rel', None) or getattr(descriptor, 'related')
-                            symbol = rel.related_name \
-                                     or rel.related_query_name \
-                                     or rel.related_model._meta.model_name
+                            symbol = rel.field.related_query_name()
                             # add dependency to reverse relation field as well
                             # this needs to be added in opposite direction on related model
                             path_segments.append(symbol)
-                            fieldentry.setdefault(rel.related_model, []).append(
+                            fieldentry[rel.related_model].append(
                                 {'path': '__'.join(path_segments), 'depends': rel.field.name})
                             path_segments.pop()
                         # add path segment to self deps if we have an fk field on a CFM
@@ -571,16 +631,16 @@ class ComputedModelsGraph(Graph):
                         # in local cf mro later on
                         if isinstance(rel, ForeignKey) and cls in computed_models:
                             self._right_constrain(cls, symbol)
-                            local_deps.setdefault(cls, {}).setdefault(field, set()).add(symbol)
+                            local_deps[cls][field].add(symbol)
                         if path_segments:
                             # add segment to intermodel graph deps
-                            fieldentry.setdefault(cls, []).append(
+                            fieldentry[cls].append(
                                 {'path': '__'.join(path_segments), 'depends': symbol})
                         path_segments.append(symbol)
-                        cls = rel.related_model
+                        cls = cast(Type[Model], rel.related_model)
                     for target_field in fieldnames:
                         self._right_constrain(cls, target_field)
-                        fieldentry.setdefault(cls, []).append(
+                        fieldentry[cls].append(
                             {'path': '__'.join(path_segments), 'depends': target_field})
         return {'globalDeps': global_deps, 'localDeps': local_deps}
 
@@ -589,7 +649,7 @@ class ComputedModelsGraph(Graph):
         Converts the global dependency data into an adjacency list tree
         to be used with the underlying graph.
         """
-        cleaned: IGlobalDepsCleaned = OrderedDict()
+        cleaned: IGlobalDepsCleaned = defaultdict(set)
         for model, fielddata in data.items():
             self.models[modelname(model)] = model
             for field, modeldata in fielddata.items():
@@ -598,7 +658,7 @@ class ComputedModelsGraph(Graph):
                     for dep in relations:
                         key = (modelname(depmodel), dep['depends'])
                         value = (modelname(model), field)
-                        cleaned.setdefault(key, set()).add(value)
+                        cleaned[key].add(value)
         return cleaned
 
     def _insert_data(self, data: IGlobalDepsCleaned) -> None:
@@ -650,8 +710,8 @@ class ComputedModelsGraph(Graph):
 
         .. code:: python
 
-            qs = target_model.objects.filter(filter_string=src_model.instance)
-            qs |= target_model.objects.filter(filter_string2=src_model.instance)
+            qs = target_model._base_manager.filter(filter_string=src_model.instance)
+            qs |= target_model._base_manager.filter(filter_string2=src_model.instance)
             ...
             bulk_updater(qs, cf_fields)
 
@@ -660,28 +720,23 @@ class ComputedModelsGraph(Graph):
         Returns a tuple of (lookup_map, fk_map).
         """
         # apply full node information to graph edges
-        table: IInterimTable = {}
+        table: IInterimTable = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(list))))
         for edge in self.edges:
             lmodel, lfield = edge.left.data
             lmodel = self.models[lmodel]
             rmodel, rfield = edge.right.data
             rmodel = self.models[rmodel]
-            table.setdefault(lmodel, {}) \
-                .setdefault(lfield, {}) \
-                .setdefault(rmodel, {}) \
-                .setdefault(rfield, []) \
-                .extend(self.resolved['globalDeps'][rmodel][rfield][lmodel])
+            table[lmodel][lfield][rmodel][rfield].extend(self.resolved['globalDeps'][rmodel][rfield][lmodel])
 
         # build lookup and path map
-        lookup_map: ILookupMap = {}
-        path_map: Dict[Type[Model], Set[str]] = {}
+        lookup_map: ILookupMap = defaultdict(lambda: defaultdict(dict))
+        path_map: Dict[Type[Model], Set[str]] = defaultdict(set)
         for lmodel, data in table.items():
             for lfield, ldata in data.items():
                 for rmodel, rdata in ldata.items():
                     fields, strings = self._resolve(rdata)
-                    lookup_map.setdefault(lmodel, {}) \
-                        .setdefault(lfield, {})[rmodel] = (fields, strings)
-                    path_map.setdefault(lmodel, set()).update(strings)
+                    lookup_map[lmodel][lfield][rmodel] = (fields, strings)
+                    path_map[lmodel].update(strings)
 
         # translate paths to model local fields and filter for fk fields
         fk_map: IFkMap = {}
@@ -845,9 +900,9 @@ class ModelGraph(Graph):
         (computed fields mro).
         """
         # create simplified parent-child relation graph
-        graph: Dict[Node, List[Node]] = {}
+        graph: Dict[Node, List[Node]] = defaultdict(list)
         for edge in self.edges:
-            graph.setdefault(edge.left, []).append(edge.right)
+            graph[edge.left].append(edge.right)
         topological_paths: Dict[Node, List[Node]] = {}
 
         # '##' has connections to all cfs thus creates the basic deps order map containing all cfs

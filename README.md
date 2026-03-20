@@ -2,15 +2,15 @@
 [![Coverage Status](https://coveralls.io/repos/github/netzkolchose/django-computedfields/badge.svg?branch=master)](https://coveralls.io/github/netzkolchose/django-computedfields?branch=master)
 
 
-### django-computedfields ###
+### django-computedfields
 
 django-computedfields provides autoupdated database fields
 for model methods.
 
-Tested with Django 3.2 and 4.0 (Python 3.7 to 3.10).
+Tested with Django 4.2 and 5.2 (Python 3.8 to 3.13).
 
 
-#### Example ####
+#### Example
 
 Just derive your model from `ComputedFieldsModel` and place
 the `@computed` decorator at a method:
@@ -30,10 +30,10 @@ class MyModel(ComputedFieldsModel):
 `computed_field` will be turned into a real database field
 and can be accessed and searched like any other database field.
 During saving the associated method gets called and it’s result
-written to the database. 
+written to the database.
 
 
-#### How to recalculate without saving the model record ####
+#### How to recalculate without saving the model record
 
 If you need to recalculate the computed field but without saving it, use
 `from computedfields.models import compute`
@@ -75,12 +75,89 @@ class MyModel(ComputedFieldsModel):
 Now changes to `self.name`, `fk` or `fk.fieldname` will update `computed_field`.
 
 
-#### Documentation ####
+#### Alternative Syntax
+
+Instead of using the `@computed` decorator with inline field definitions,
+you can also use a more declarative syntax with `ComputedField`, example from above rewritten:
+
+```python
+from django.db import models
+from computedfields.models import ComputedFieldsModel, ComputedField
+
+def get_upper_string(inst):
+    return inst.name.upper()
+
+class MyModel(ComputedFieldsModel):
+    name = models.CharField(max_length=32)
+    computed_field = ComputedField(
+        models.CharField(max_length=32),
+        depends=[('self', ['name'])],
+        compute=get_upper_string
+    )
+```
+
+
+#### Documentation
 
 The documentation can be found [here](https://django-computedfields.readthedocs.io/en/latest/index.html).
 
 
-#### Changelog ####
+#### Changelog
+- 0.3.6
+    - Django 6.0 support
+    - Django 4.2 support dropped
+    - Fix 2 field merge bugs in not_computed resync (#207, #211)
+    - Fix checkdata bugs (#203, #204)
+- 0.3.5
+    - performance improvement: allow select_related/prefetch_related on UNIONed resolver updates
+- 0.3.4
+    - Fix UNIONed resolver updates, that contain select_related
+- 0.3.3
+    - auto recovery for not_computed context
+- 0.3.2
+    - regression fix (#190): add implicit fk dependencies from reverse relations
+- 0.3.1 (discouraged due to regression #190)
+    - improved CF updates on through models
+    - limitations section in docs
+- 0.3.0 - new beta release (discouraged due to regression #190)
+    - new features:
+        - default_on_create argument for @computed
+        - not_computed context to disable resolver temporarily
+        - resolver signals
+    - enhancements:
+        - altered m2m handling with full through model expansion
+        - reduced transaction pressure in resolver
+- 0.2.10
+    - Fix related_query_name on M2M relations
+    - Fix computed fk fields to use instances and not the _id attribute (BREAKING CHANGE)
+    - Fix UNIONed resolver updates, that contain prefetches
+    - Fix thread isolation in signal handlers
+- 0.2.9
+    - fix related_query_name issue
+- 0.2.8
+    - Django 5.2 support
+- 0.2.7
+    - setuptools issue fixed
+- 0.2.6
+    - Django 5.1 support
+- 0.2.5
+    - Django 5.0 & Python 3.12 support
+    - Django 3.2 support dropped
+- 0.2.4
+    - performance improvement: use OR for simple multi dependency query construction
+    - performance improvement: better queryset narrowing for M2M lookups
+    - `ComputedField` for a more declarative code style added
+
+- 0.2.3
+    - performance improvement: use UNION for multi dependency query construction
+
+- 0.2.2
+    - Django 4.2 support
+    - Use `model._base_manager` instead of `model.objects` to prevent using overridden `models.objects` with a custom manager
+
+- 0.2.1
+    - Django 4.1 support
+
 - 0.2.0 - next beta release
     - new features:
         - better memory control for the update resolver via

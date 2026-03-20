@@ -1,6 +1,6 @@
 from django.db import models
 import sys
-from computedfields.models import ComputedFieldsModel, computed, precomputed
+from computedfields.models import ComputedFieldsModel, computed, precomputed, ComputedField
 
 
 def model_factory(name, keys):
@@ -75,6 +75,8 @@ class NoRelatedA(ComputedFieldsModel):
     ])
     def comp(self):
         res = [self.name]
+        if not self.pk:
+            return '#'.join(res)
         for b in self.norelatedb_set.all():
             res.append(b.name)
             for c in b.norelatedc_set.all():
@@ -163,11 +165,15 @@ class PartialUpdateB(ComputedFieldsModel):
 class Parent(ComputedFieldsModel):
     @computed(models.IntegerField(default=0), depends=[('children', ['parent'])])
     def children_count(self):
+        if not self.pk:
+            return 0
         return self.children.all().count()
 
     @computed(models.IntegerField(default=0), depends=[('children.subchildren', ['subparent'])])
     def subchildren_count(self):
         count = 0
+        if not self.pk:
+            return count
         for child in self.children.all():
             count += child.subchildren.all().count()
         return count
@@ -176,6 +182,8 @@ class Parent(ComputedFieldsModel):
     def subchildren_count_proxy(self):
         from functools import reduce
         from operator import add
+        if not self.pk:
+            return 0
         return reduce(add, (el.subchildren_count for el in self.children.all()), 0)
 
 class Child(ComputedFieldsModel):
@@ -183,6 +191,8 @@ class Child(ComputedFieldsModel):
 
     @computed(models.IntegerField(default=0), depends=[('subchildren', ['subparent'])])
     def subchildren_count(self):
+        if not self.pk:
+            return 0
         return self.subchildren.all().count()
 
 class Subchild(models.Model):
@@ -192,6 +202,8 @@ class Subchild(models.Model):
 class XParent(ComputedFieldsModel):
     @computed(models.IntegerField(default=0), depends=[('children', ['value'])])
     def children_value(self):
+        if not self.pk:
+            return 0
         return self.children.all().aggregate(sum=models.Sum('value'))['sum'] or 0
 
 class XChild(models.Model):
@@ -204,6 +216,8 @@ class DepBaseA(ComputedFieldsModel):
     @computed(models.CharField(max_length=256), depends=[('sub1.sub2.subfinal', ['name'])])
     def final_proxy(self):
         s = ''
+        if not self.pk:
+            return s
         for s1 in self.sub1.all().order_by('pk'):
             for s2 in s1.sub2.all().order_by('pk'):
                 for sf in s2.subfinal.all().order_by('pk'):
@@ -214,6 +228,8 @@ class DepBaseB(ComputedFieldsModel):
     @computed(models.CharField(max_length=256), depends=[('sub1.sub2.subfinal', ['name'])])
     def final_proxy(self):
         s = ''
+        if not self.pk:
+            return s
         for s1 in self.sub1.all().order_by('pk'):
             for s2 in s1.sub2.all().order_by('pk'):
                 for sf in s2.subfinal.all().order_by('pk'):
@@ -256,11 +272,15 @@ class Concrete(Abstract):
 class ParentOfAbstract(ComputedFieldsModel):
     @computed(models.IntegerField(default=0), depends=[('children', ['parent'])])
     def children_count(self):
+        if not self.pk:
+            return 0
         return self.children.all().count()
 
     @computed(models.IntegerField(default=0), depends=[('children.subchildren', ['subparent'])])
     def subchildren_count(self):
         count = 0
+        if not self.pk:
+            return count
         for child in self.children.all():
             count += child.subchildren.all().count()
         return count
@@ -269,6 +289,8 @@ class ParentOfAbstract(ComputedFieldsModel):
     def subchildren_count_proxy(self):
         from functools import reduce
         from operator import add
+        if not self.pk:
+            return 0
         return reduce(add, (el.subchildren_count for el in self.children.all()), 0)
 
 
@@ -282,6 +304,8 @@ class AbstractChild(ComputedFieldsModel):
 class ConcreteChild(AbstractChild):
     @computed(models.IntegerField(default=0), depends=[('subchildren', ['subparent'])])
     def subchildren_count(self):
+        if not self.pk:
+            return 0
         return self.subchildren.all().count()
 
 
@@ -472,6 +496,8 @@ class ParentReverseNotO(ComputedFieldsModel):
     )
     def children_comp(self):
         s = []
+        if not self.pk:
+            return '$'.join(s)
         for child in self.children.all():
             substr = child.name
             ss = []
@@ -502,6 +528,8 @@ class ParentReverseO(ComputedFieldsModel):
     )
     def children_comp(self):
         s = []
+        if not self.pk:
+            return '$'.join(s)
         for child in self.children.all():
             substr = child.name
             ss = []
@@ -572,6 +600,8 @@ class Registration(ComputedFieldsModel):
     @computed(models.FloatField(default=0), depends=[('payment_set', ['amount'])])
     def total_amount(self):
         paid = 0
+        if not self.pk:
+            return paid
         for cur_payment in self.payment_set.all():
             paid += cur_payment.amount
         return paid
@@ -697,6 +727,8 @@ class FixtureParent(ComputedFieldsModel):
 
     @computed(models.IntegerField(default=0), depends=[('children', ['parent'])])
     def children_count(self):
+        if not self.pk:
+            return 0
         return self.children.count()
 
 class FixtureChild(ComputedFieldsModel):
@@ -864,7 +896,13 @@ class ChildModel(ParentModel):
 class ChildModel2(ParentModel):
     pseudo = models.CharField(max_length=255, default="")
 
-    @computed(models.CharField(max_length=255, null=True, blank=True), depends=[("parentmodel_ptr", ["name", "z", "x"])])
+    @computed(models.CharField(max_length=255, null=True, blank=True), depends=[
+        # fix random failure with pytest:
+        # self entry was missing, thus the MRO not stable
+        # (for unkown reason this never showed up with manage.py test)
+        ("self", ["name", "z", "x"]),
+        ("parentmodel_ptr", ["name", "z", "x"])
+    ])
     def other_name(self):
         return f"{self.x}{self.name}{self.z}"
 
@@ -1040,3 +1078,321 @@ class Querysize(ComputedFieldsModel):
     @computed(models.CharField(max_length=32), depends=[('self', ['name'])])
     def default(self):
         return self.name
+
+
+# ComputedField factory: direct usage test
+def calc_d(inst):
+    return inst.a * inst.b
+
+class FactorySimple(ComputedFieldsModel):
+    a = models.IntegerField()
+    b = models.IntegerField()
+    c = ComputedField(models.IntegerField(default=0), compute=lambda inst: inst.a + inst.b)
+    d = ComputedField(models.IntegerField(default=0), compute=calc_d)
+
+
+# better M2M handling #131
+class HaTag(models.Model):
+    name = models.CharField(max_length=100, unique=True)
+
+class Ha(ComputedFieldsModel):
+    tags = models.ManyToManyField(HaTag, blank=True, related_name="ha_s")
+
+    @computed(
+        models.CharField(null=False, blank=True, max_length=100),
+        depends=[("tags", ["name"])],
+    )
+    def all_tags(self):
+        v = [] if not self.pk else list(self.tags.all().values_list('name', flat=True).order_by('pk'))
+        return ','.join(v)
+
+class HaTagProxy(HaTag):
+    class Meta:
+        proxy = True
+
+class HaProxy(Ha):
+    class Meta:
+        proxy = True
+
+
+# related_name vs. related_query_name issue #165
+class RNFoo(ComputedFieldsModel):
+    @computed(models.CharField(max_length=256), depends=[('bars', ['b'])])
+    def comp(self):
+        s = ''
+        if self.pk:
+            for bar in self.bars.all().order_by('pk'):
+                s += bar.b
+        return s
+
+class RNBar(models.Model):
+    b = models.CharField(max_length=10)
+    foo = models.ForeignKey(RNFoo, related_name='bars', related_query_name='bar', on_delete=models.CASCADE)
+
+
+# related_name vs. related_query_name for m2m issue #172
+class RNM2MFoo(ComputedFieldsModel):
+    @computed(models.CharField(max_length=256), depends=[('bars', ['b'])])
+    def comp(self):
+        s = ''
+        if self.pk:
+            for bar in self.bars.all().order_by('pk'):
+                s += bar.b
+        return s
+
+class RNM2MBar(models.Model):
+    b = models.CharField(max_length=10)
+    foos = models.ManyToManyField(RNM2MFoo, related_name='bars', related_query_name='bar')
+
+
+# Computed Foreign Key models
+## Base catalogues
+class CFKCatalogue1(models.Model):
+    name = models.CharField(max_length=10)
+
+class CFKCatalogue2(models.Model):
+    name = models.CharField(max_length=10)
+
+## Some data in catalogues
+class CFKData(ComputedFieldsModel):
+    c1name = models.CharField(max_length=10)
+    c2name = models.CharField(max_length=10)
+
+    @computed(models.ForeignKey(CFKCatalogue1, null=True, on_delete=models.CASCADE))
+    def c1(self):
+        return CFKCatalogue1.objects.get(name=self.c1name)
+
+    @computed(models.ForeignKey(CFKCatalogue2, null=True, on_delete=models.CASCADE))
+    def c2(self):
+        return CFKCatalogue2.objects.get(name=self.c2name)
+
+## Some data related to parent data in catalogues
+class CFKRelatedData(ComputedFieldsModel):
+    parent = models.ForeignKey(CFKData, on_delete=models.CASCADE)
+    value = models.CharField(max_length=10)
+
+    @computed(models.ForeignKey(CFKCatalogue1, null=True, on_delete=models.CASCADE))
+    def c1(self):
+        return self.parent.c1
+
+    @computed(models.ForeignKey(CFKCatalogue2, null=True, on_delete=models.CASCADE))
+    def c2(self):
+        return self.parent.c2
+
+
+# issue #144
+from collections import Counter
+
+class Tag(ComputedFieldsModel):
+    name = models.CharField(max_length=32, unique=True)
+
+run_counters = Counter()
+
+class Advert(ComputedFieldsModel):
+    name = models.CharField(max_length=32)
+
+    tags = models.ManyToManyField(
+        Tag,
+        related_name="adverts"
+    )
+
+    @computed(
+        field=models.CharField(max_length=500),
+        depends=[("tags", ["name"])]
+    )
+    def all_tags(self) -> str:
+        run_counters.update(["all_tags"])
+        if not self.pk:
+            return ""
+        return ", ".join(self.tags.values_list("name", flat=True))
+
+    def __str__(self) -> str:
+        return f"{self.name}"
+
+class Room(ComputedFieldsModel):
+    name = models.CharField(max_length=32)
+    advert = models.ForeignKey(Advert, related_name="rooms", on_delete=models.CASCADE)
+
+    @computed(
+        field=models.BooleanField(default=False),
+        depends=[("advert.tags", ["name"])]
+    )
+    def is_ready(self) -> bool:
+        run_counters.update(["is_ready"])
+        if not self.pk:
+            return False
+        return self.advert.tags.filter(name="ready").exists()
+
+    def __str__(self) -> str:
+        return f"{self.name}"
+
+
+# default_on_create tests
+class DefaultParent(ComputedFieldsModel):
+    name = models.CharField(max_length=32)
+    children_names = ComputedField(
+        models.CharField(max_length=256, default='NOTHING'),
+        depends=[('children', ['name'])],
+        compute=lambda inst: ','.join(inst.children.all().values_list('name', flat=True)),
+        default_on_create=True
+    )
+
+class DefaultChild(ComputedFieldsModel):
+    name = models.CharField(max_length=32)
+    parent = models.ForeignKey(DefaultParent, related_name='children', on_delete=models.CASCADE)
+    toys = models.ManyToManyField('DefaultToy', related_name='children')
+    toy_names = ComputedField(
+        models.CharField(max_length=256, default=lambda:'NO TOYS, SAD'),
+        depends=[('toys', ['name'])],
+        compute=lambda inst: ','.join(inst.toys.all().values_list('name', flat=True)),
+        default_on_create=True
+    )
+
+class DefaultToy(ComputedFieldsModel):
+    name = models.CharField(max_length=32)
+
+    @computed(
+        models.CharField(max_length=256, default='no one wants to play with this'),
+        depends=[('children', ['name'])],
+        default_on_create=True
+    )
+    def children_names(self):
+        return ','.join(self.children.all().values_list('name', flat=True))
+
+
+# not_computed context & bug #190
+from fast_update.query import FastUpdateManager
+from django.db.models import Sum
+
+class Shelf(ComputedFieldsModel):
+    name = models.CharField(max_length=32)
+    book_names = ComputedField(
+        models.CharField(max_length=1000, default=''),
+        depends=[('books', ['name'])],
+        compute=lambda inst:','.join(inst.books.all().values_list('name', flat=True)),
+        default_on_create=True
+    )
+    page_sum = ComputedField(
+        models.PositiveIntegerField(default=0),
+        depends=[('books.pages', ['num'])],
+        compute=lambda inst: Page.objects.filter(book__shelf=inst).aggregate(sum=Sum('num'))['sum'] or 0,
+        default_on_create=True
+    )
+
+class Book(models.Model):
+    name = models.CharField(max_length=32)
+    shelf = models.ForeignKey(Shelf, related_name='books', on_delete=models.CASCADE)
+    objects = FastUpdateManager()
+
+class Page(models.Model):
+    num = models.PositiveIntegerField()
+    book = models.ForeignKey(Book, related_name='pages', on_delete=models.CASCADE)
+
+
+# fix #187 - CF on through model w'o any other m2m dependency
+class AT(models.Model):
+    name = models.CharField(max_length=32)
+
+class BT(models.Model):
+    name = models.CharField(max_length=32)
+    ats = models.ManyToManyField(to=AT, through='ATBT', related_name='bts')
+
+class ATBT(ComputedFieldsModel):
+    at = models.ForeignKey(AT, on_delete=models.CASCADE)
+    bt = models.ForeignKey(BT, on_delete=models.CASCADE)
+    names = ComputedField(
+        models.CharField(max_length=64, default=''),
+        depends=[('at', ['name']), ('bt', ['name'])],
+        compute=lambda inst: inst.at.name + inst.bt.name
+    )
+
+
+# union & select/prefetch_related settings (test_union_related_settings.py)
+class UAppartment(models.Model):
+    number = models.PositiveIntegerField()
+    street = models.CharField(max_length=32)
+
+class UPerson(ComputedFieldsModel):
+    appartment = models.ForeignKey(UAppartment, null=True, related_name='persons', on_delete=models.CASCADE)
+    parent = models.ForeignKey('self', null=True, related_name='children', on_delete=models.CASCADE)
+    at_parent = models.BooleanField(default=False)
+
+    @computed(
+        models.CharField(max_length=64),
+        depends=[
+            ('self', ['at_parent']),
+            ('appartment', ['number', 'street']),
+            ('parent.appartment', ['number', 'street'])
+        ],
+        # gets patched in by the test case
+        #select_related=['appartment', 'parent__appartment']
+        #prefetch_related=['appartment', 'parent__appartment']
+    )
+    def address(self):
+        if self.at_parent:
+            return f'App #{self.parent.appartment.number}, {self.parent.appartment.street}'
+        return f'App #{self.appartment.number}, {self.appartment.street}'
+
+
+# issue #210: not_computed context _resync update_fields handling
+# Test Case 1: Model save with update_fields that don't affect M2M dependency field
+# should NOT trigger unnecessary updates on related models
+class ResyncModelA(ComputedFieldsModel):
+    field_1 = models.FloatField(default=0.0)
+    field_2 = models.FloatField(default=0.0)
+
+    @computed(
+        models.FloatField(default=0.0),
+        depends=[('self', ['field_1', 'field_2'])]
+    )
+    def computed_field(self):
+        return self.field_1 + self.field_2
+
+
+class ResyncModelB(ComputedFieldsModel):
+    m2m_field = models.ManyToManyField(ResyncModelA, related_name='model_b_set')
+
+    @computed(
+        models.FloatField(default=0.0),
+        depends=[('m2m_field', ['id'])]
+    )
+    def computed_field(self):
+        """
+        This computed field depends only on the 'id' of related ResyncModelA instances.
+        When ResyncModelA.save(update_fields=['field_1']) is called, this should NOT
+        trigger an update of ResyncModelB because 'field_1' is not in the depends list.
+        """
+        if not self.pk:
+            return 0.0
+        return sum(obj.field_1 for obj in self.m2m_field.all())
+
+
+# Test Case 2: Model save with update_fields that SHOULD trigger dependent model update
+class ResyncModelC(ComputedFieldsModel):
+    field_1 = models.FloatField(default=0.0)
+
+    @computed(
+        models.FloatField(default=0.0),
+        depends=[('self', ['field_1'])]
+    )
+    def computed_field(self):
+        return self.field_1 * 2
+
+
+class ResyncModelD(ComputedFieldsModel):
+    m2m_field = models.ManyToManyField(ResyncModelC, related_name='model_d_set')
+
+    @computed(
+        models.FloatField(default=0.0),
+        depends=[('m2m_field', ['field_1'])]
+    )
+    def computed_field(self):
+        """
+        This computed field depends on 'field_1' of related ResyncModelC instances.
+        When ResyncModelC.save(update_fields=['field_1']) is called, this SHOULD
+        trigger an update of ResyncModelD because 'field_1' is in the depends list.
+        """
+        if not self.pk:
+            return 0.0
+        return sum(obj.field_1 for obj in self.m2m_field.all())
+

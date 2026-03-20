@@ -5,9 +5,10 @@ from json import dumps
 from datetime import timedelta
 
 from django.core.management.base import BaseCommand, CommandError
+from django.core.serializers.json import DjangoJSONEncoder
 from django.db import transaction, DatabaseError
 
-from computedfields.helper import modelname, slice_iterator
+from computedfields.helpers import modelname, slice_iterator
 from computedfields.settings import settings
 from computedfields.models import active_resolver
 from ._helpers import tqdm, HAS_TQDM, retrieve_computed_models
@@ -72,13 +73,14 @@ class Command(BaseCommand):
         end_time = time()
         duration = int(end_time - start_time)
         self.eprint(f'\nTotal check time: {timedelta(seconds=duration)}')
-        sys.exit(1 if has_desync else 0)
+        if has_desync:
+            raise CommandError('Desync data found.', returncode=1)
     
     @transaction.atomic
     def action_check(self, models, progress, size, json_out):
         has_desync = False
         for model in models:
-            qs = model.objects.all()
+            qs = model._base_manager.all()
             amount = qs.count()
             fields = set(active_resolver.computed_models[model].keys())
             qsize = active_resolver.get_querysize(model, fields, size)
@@ -132,7 +134,7 @@ class Command(BaseCommand):
                         if len(tainted) >= TAINTED_MAXLENGTH:
                             self.eprint(self.style.NOTICE('  (listing shortened...)'))
                 if json_out:
-                    json_out.write(dumps({'model': modelname(model), 'desync': desync}))
+                    json_out.write(dumps({'model': modelname(model), 'desync': desync}, cls=DjangoJSONEncoder))
         return has_desync
 
 

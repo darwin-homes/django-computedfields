@@ -84,3 +84,7 @@ def proxy_to_base_model(proxymodel: Type[Model]) -> Union[Type[Model], None]:
         if hasattr(m, '_meta') and not m._meta.proxy and not m._meta.abstract:
             return m
     return None
+
+
+def are_same(*args) -> bool:
+    return len(set(args)) == 1

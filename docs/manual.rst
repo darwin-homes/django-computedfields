@@ -107,10 +107,38 @@ The ``@computed`` decorator expects a model field instance as first argument to 
 result of the decorated method.
 
 
+Alternative Syntax
+------------------
+
+For a more declarative code style you can use the ``ComputedField`` factory method instead
+(since version 2.4.0):
+
+.. code-block:: python
+
+    from django.db import models
+    from computedfields.models import ComputedFieldsModel, ComputedField
+
+    class Person(ComputedFieldsModel):
+        forename = models.CharField(max_length=32)
+        surname = models.CharField(max_length=32)
+        combined = ComputedField(
+            models.CharField(max_length=32),
+            depends=[('self', ['surname', 'forename'])],
+            compute=lambda inst: f'{inst.surname}, {inst.forename}'
+        )
+
+which yields the same behavior as the decorator. ``ComputedField`` expects
+the same arguments as the decorator, plus the compute function as ``compute``.
+The compute function should expect a model instance as single argument.
+
+While the code examples of this guide use only the decorator syntax,
+they also apply to the declarative syntax with ``ComputedField``.
+
+
 Automatic Updates
 -----------------
 
-The  `depends` keyword argument of the ``@computed`` decorator can be used with any relation
+The  `depends` keyword argument can be used with any relation
 to indicate dependencies to fields on other models as well.
 
 The example above extended by a model ``Address``:
@@ -165,9 +193,9 @@ pulls data from.
             # normal invocation with correct data pull across correct relation
             return self.nullable_relation.field
 
-    A special case in this regard are m2m relations during the first save of a newly
-    created instance, which cannot access the relation yet. You have to handle this case
-    explicitly as well:
+    A special case in this regard are m2m relations (and also backrelations under Django >=4.1)
+    during the first save of a newly created instance, which cannot access the relation yet.
+    You have to handle this case explicitly:
 
     .. CODE:: python
 
@@ -178,9 +206,13 @@ pulls data from.
                 return ''
             # normal data pull across m2m relation
             return ''.join(self.m2m.all().values_list('field', flat=True))
+    
+    Alternatively you can set the `default_on_create` argument of the decorator to true
+    and provide a default value on the inner field. This will completely skip the
+    compute function for new instances.
 
-    Pulling field dependencies over m2m relations has several more drawbacks, in general
-    it is a good idea to avoid m2m relations in `depends` as much as possible.
+    Please note that using m2m fields in `depends` will quickly lead to bad update performance.
+    In general it is a good idea to avoid m2m relations in `depends` as much as possible.
     Also see examples about m2m relations.
 
 .. WARNING::
@@ -197,7 +229,7 @@ If you have a custom ``save`` method defined on your model, it is important to n
 that by default local computed field values are not yet updated to their new values during the invocation,
 as this happens in ``ComputedFieldModel.save`` afterwards. Thus code in ``save`` still sees old values.
 
-With the decorator ``@precomputed`` you can change that behavior to also update computed fields
+With the decorator ``@precomputed`` you can change that behavior to update computed fields
 before entering your custom save method:
 
 .. code-block:: python
@@ -264,12 +296,12 @@ computed fields have been finally updated.
     For more advanced usage in conjunction with bulk actions and `update_dependent` see below and in the
     examples documentation.
 
-On ORM level all updates are turned into select querysets filtering on dependent computed field models
+On ORM level all updates are turned into select querys filtering on dependent computed field models
 in ``update_dependent``. A dependency like ``['a.b.c', [...]]`` of a computed field on model `X` will either
 be turned into a queryset like ``X.objects.filter(a__b__c=instance)`` or ``X.objects.filter(a__b__c__in=instance)``,
 depending on `instance` being a single model instance or a queryset of model `C`.
 
-The auto resolver only triggers field updates for real values changes by comparing old and new value.
+The auto resolver only triggers field updates for real values changes by comparing old and new values.
 If a `depends` rule contains a 1:`n` relation (reverse fk relation), ``update_dependent`` additionally updates
 old relations, that were grabbed by a `pre_save` signal handler.
 Similar measures to catch old relations are in place for m2m relations and delete actions (see `handlers.py`).
@@ -344,8 +376,154 @@ which is not allowed. Computed fields inherited from the parent model keep worki
 (treated as alias). Constructing depends rules from proxy models is not supported (untested).
 
 
+Signals
+-------
+
+Version 0.3.0 introduced 3 custom signals sent by the resolver:
+
+- `resolver_start` indicates the start of a resolver update
+- `resolver_update` sent immediately after a model's bulk update
+- `resolver_exit` indicates the exit of a resolver update
+
+The interesting signal is `resolver_update`, as it allows you to introspect,
+which computed fields on which records were updated. But since that signal is sent right away from deep within
+the resolver's tree update, it comes with a few caveats:
+
+- still in resolver DFS recursion
+- database not fully resynced yet
+- still under the resolver's transaction umbrella
+
+
+.. WARNING::
+
+    To not compromise the resolver's tree update, you should not use any complicated or likely-to-fail code
+    in your `resolver_update` handler. Also database interactions, especially calls to `update_dependent`,
+    should be avoided.
+
+Instead collect the interesting data points and wait for the `resolver_exit` signal.
+After that you can safely do your processing, example:
+
+.. CODE:: python
+
+    from computedfields.signals import resolver_update, resolver_exit
+
+    def collect_updates(sender, model, fields, pks, **kwargs):
+        # filter for updates of ModelXY.comp
+        if model == ModelXY and 'comp' in fields:
+            # only collect stuff here
+            store_somewhere(pks)
+    resolver_update.connect(collect_updates)
+
+    def on_resolver_exit(sender, **kwargs):
+        # retrieve updated pks for ModelXY.comp
+        pks = retrieve_again()
+        # here it is safe to do all nasty things
+        # without compromising the resolver update
+        likely_to_fail(ModelXY.objects.filter(pk__in=pks))
+    resolver_exit.connect(on_resolver_exit)
+
+
+
+Known Limitations
+-----------------
+
+The following section tries to list known limitations of :mod:`django-computedfields`,
+esp. around more advanced ORM usage pattern.
+
+
+Composite PKs
+^^^^^^^^^^^^^
+
+Django 5.2 introduced support for composite pks, which are currently yet not supported by
+:mod:`django-computedfields`.
+
+
+Computed ForeignKey Fields
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Computed foreign keys are somewhat special, as they can mess up the resolver's tree update
+by changing the affected records during an ongoing update. The resolver is currently not prepared
+for this, thus you should avoid them in dependency chains. So depending other computed fields on
+computed foreign keys is a bad idea. (A future release might lift that restriction,
+if there is some demand and the extra workload can be justified.)
+
+Computed foreign key fields can still be used as terminal computed field
+(leaf node in the dependency tree).
+
+.. ATTENTION::
+
+    There was a long standing bug in the releases 0.1.5 to 0.2.9, where you had to return
+    the pk of the fk instance from the computed function. This was finally fixed with release 0.2.10,
+    from this release on you again have to return the instance itself.
+    This is a *BREAKING CHANGE* for your compute functions on computed foreign keys.
+
+
+Related Managers
+^^^^^^^^^^^^^^^^
+
+Django's `RelatedManager` supports several mass actions like ``add``, ``remove``, ``clear`` and ``set``
+(also see `official Django docs
+<https://docs.djangoproject.com/en/5.2/ref/models/relations/>`_). While most developers know these actions
+from m2m relations, they are less known or used on fk relations. With :mod:`django-computedfields` there are
+several catches around those mass actions.
+
+The mass actions on m2m relations are known to work with :mod:`django-computedfields`,
+changes get caught by the `m2m_changed` signal handler, which will trigger the update of
+dependent computed fields (also see restrictions on the through model below).
+
+On fk relations the mass actions will not trigger the update of dependent computed fields by default.
+Their default argument `bulk=True` causes them to use bulk actions internally not triggering any signal
+we could listen to. You have 2 options to work around this issue:
+
+- Call the action with the `bulk=False` argument. With this, the mass action will use single instance actions
+  internally, which triggers the dependent updates. Note that this may show poor performance.
+- Stick with `bulk=True` and trigger the updates yourself, schematically:
+
+    .. CODE:: python
+
+        class Blog(models.Model):
+            ...
+        class Entry(models.Model):
+            blog = models.ForeignKey(Blog, on_delete=models.CASCADE, null=True)
+
+        # add
+        b.entry_set.add(*objs)
+        pks = set(o.pk for o in objs)
+        update_dependent(Entry.objects.filter(pk__in=pks), update_fields=['blog'])
+
+        # remove
+        b.entry_set.remove(*objs)
+        pks = set(o.pk for o in objs)
+        update_dependent(Entry.objects.filter(pk__in=pks), update_fields=['blog'])
+
+        # clear
+        pks = set(b.entry_set.all().values_list('pk', flat=True))
+        b.entry_set.clear()
+        update_dependent(Entry.objects.filter(pk__in=pks), update_fields=['blog'])
+
+        # set
+        old = preupdate_dependent(b.entry_set.all(), update_fields=['blog'])
+        b.entry_set.set(objs)
+        pks = set(o.pk for o in objs)
+        update_dependent(Entry.objects.filter(pk__in=pks), update_fields=['blog'], old=old)
+
+
+M2M Through Model
+^^^^^^^^^^^^^^^^^
+
+In general M2M support of this library has matured a lot over the time. Updates from mass actions
+should work as expected, also computed fields on through models are supported.
+
+There is one exception to this - for multiple M2M relations pointing to the same through model things
+get quite hairy with the ORM. Currently the resolver cannot update dependencies across those relations
+reliably from mass actions, as the ORM does not provide enough context information with its
+*m2m_changed* signal to determine the underlying relation. If you have such an advanced use case,
+be prepared to update the dependencies yourself by calling *(pre)update_dependent* explicitly
+in conjunction with mass actions.
+
+
 f-expressions
--------------
+^^^^^^^^^^^^^
 
 While f-expressions are a nice way to offload some work to the database, they are not supported
 with computed fields. In particular this means, that computed fields should not depend on
@@ -512,16 +690,18 @@ Best Practices
 ^^^^^^^^^^^^^^
 
 - start highly normalized
-- cover needed field calculations with field annotations where possible
+- cover needed field calculations with field annotations or `GeneratedField` where possible
 - do other calculations in normal methods/properties
 
 These steps should be followed first, as they guarantee low to no redundancy of the data if properly done,
 before resorting to any denormalization trickery. Of course complicated field calculations create
-additional workload either on the database or in Python, which might turn into serious query bottlenecks in your project.
+additional workload either on the database or in Python, which might turn into serious query bottlenecks
+in your project.
 
-That is the point where :mod:`django-computedfields` can help by creating pre-computed fields.
-It can remove the recurring calculation workload during queries by providing precalculated values.
-Please keep in mind, that this comes to a price:
+That is the point where :mod:`django-computedfields` can help by creating pre-computed database fields.
+It removes the recurring calculation workload during select queries by moving the calculation work
+to inserts and updates.
+Please keep in mind, that this comes at a price:
 
 - additional space requirement in database
 - redundant data (as with any denormalization)
@@ -531,7 +711,7 @@ Please keep in mind, that this comes to a price:
 
 If your project suffers from query bottlenecks created by recurring field calculations and
 you have ruled out worse negative side effects from the list above,
-:mod:`django-computedfields` can help to speed up some parts of your Django project.
+:mod:`django-computedfields` can help you to speed up some parts of your Django project.
 
 
 Specific Usage Hints
@@ -546,8 +726,8 @@ Specific Usage Hints
   affected computed fields only once, it does not help much, if method invocations have to touch 80%
   of all database entries to get the updates done.
 - Try to apply `select_related` and `prefetch_related` optimizations for complicated dependencies. While this can
-  reduce the query load by far, it also increases memory usage alot, thus it needs proper testing to find the sweep spot.
-  Also see optimization examples documentation.
+  reduce the query load by far, it also increases memory usage alot, thus it needs proper testing to find
+  the sweet spot. Also see the documentation of optimization examples.
 - Try to reduce the "update pressure" by grouping update paths by dimensions like update frequency or update penalty
   (isolate the slowpokes). Mix in fast turning entities late.
 
@@ -582,6 +762,58 @@ a similar feature in Django's ORM.
 
 Changelog
 ---------
+
+- 0.3.6
+    - Django 6.0 support
+    - Django 4.2 support dropped
+    - Fix 2 field merge bugs in not_computed resync (#207, #211)
+    - Fix checkdata bugs (#203, #204)
+- 0.3.5
+    - performance improvement: allow select_related/prefetch_related on UNIONed resolver updates
+- 0.3.4
+    - Fix UNIONed resolver updates, that contain select_related
+- 0.3.3
+    - auto recovery for not_computed context
+- 0.3.2
+    - regression fix (#190): add implicit fk dependencies from reverse relations
+- 0.3.1 (discouraged due to regression #190)
+    - improved CF updates on through models
+    - limitations section in docs
+- 0.3.0 - new beta release (discouraged due to regression #190)
+    - new features:
+        - default_on_create argument for @computed
+        - not_computed context to disable resolver temporarily
+        - resolver signals
+    - enhancements:
+        - altered m2m handling with full through model expansion
+        - reduced transaction pressure in resolver
+- 0.2.10
+    - Fix related_query_name on M2M relations
+    - Fix computed fk fields to use instances and not the _id attribute (BREAKING CHANGE)
+    - Fix UNIONed resolver updates, that contain prefetches
+    - Fix thread isolation in signal handlers
+- 0.2.9
+    - fix related_query_name issue
+- 0.2.8
+    - Django 5.2 support
+- 0.2.7
+    - setuptools issue fixed
+- 0.2.6
+    - Django 5.1 support
+- 0.2.5
+    - Django 5.0 & Python 3.12 support
+    - Django 3.2 support dropped
+- 0.2.4
+    - performance improvement: use OR for simple multi dependency query construction
+    - performance improvement: better queryset narrowing for M2M lookups
+    - `ComputedField` for a more declarative code style added
+- 0.2.3
+    - performance improvement: use UNION for multi dependency query construction
+- 0.2.2
+    - Django 4.2 support
+    - Use `model._base_manager` instead of `model.objects`
+- 0.2.1
+    - Django 4.1 support
 - 0.2.0 - next beta release
     - new features:
         - better memory control for the update resolver via
